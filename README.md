@@ -36,9 +36,8 @@ python train.py --mode eval --model.depth_wise 12/20/28 --model.num_classes 1000
 - To use any adaptive-step ODE solver from [diffrax](https://github.com/patrick-kidger/diffrax) or any other sampling setting, look at `helper_inference.py`.
 
 ### Checkpoints and FID Stats
-[SM](https://github.com/kvfrans/shortcut-models/) checkpoints and precomputed reference FID stats for CelebA and ImageNet can be downloaded from [their gdrive](https://drive.google.com/drive/folders/1g665i0vMxm8qqqcp5mAiexnL919-gMwW?usp=sharing).
-
-Our checkpoints, and precomputed reference FID stats for CelebA and ImageNet can be downloaded from [this gdrive](https://drive.google.com/drive/folders/1ZzWY9jZBRXKiyTnTG-ZWiWAd4w2PEDIZ?usp=sharing).
+- [SM](https://github.com/kvfrans/shortcut-models/) checkpoints and precomputed reference FID stats for CelebA and ImageNet can be downloaded from [their gdrive](https://drive.google.com/drive/folders/1g665i0vMxm8qqqcp5mAiexnL919-gMwW?usp=sharing).
+- Our checkpoints, and precomputed reference FID stats for CelebA and ImageNet can be downloaded from [this gdrive](https://drive.google.com/drive/folders/1ZzWY9jZBRXKiyTnTG-ZWiWAd4w2PEDIZ?usp=sharing).
 
 ## 📌 Citation
 If you find this work useful for your research, please consider citing it:
