@@ -16,4 +16,4 @@ dependencies:
     - glew
     - glfw
     - Cython<3
-    - conda-forge::opencv
+    - opencv

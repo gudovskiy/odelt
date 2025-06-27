@@ -38,12 +38,6 @@ class Checkpoint:
             return self._values[name]
         except AttributeError:
             raise ValueError(name)
-        
-    def set_model(self, model):
-        for key in model.__dict__.keys():
-            data = getattr(model, key)
-            if hasattr(data, 'save') or key == 'config':
-                self._values[key] = getattr(model, key)
 
     def save(self, filename=None, keys=None):
         assert self._filename or filename
@@ -58,7 +52,7 @@ class Checkpoint:
     def _save(self, filename, keys):
         keys = tuple(self._values.keys() if keys is None else keys)
         assert all([not k.startswith('_') for k in keys]), keys
-        data = {k: (self._values[k].save() if k != 'config' else self._values[k]) for k in keys}
+        data = {k: (self._values[k] if k != 'config' else self._values[k]) for k in keys}
         data['_timestamp'] = time.time()
         content = pickle.dumps(data)
         if 'gs://' in filename:
@@ -67,11 +61,11 @@ class Checkpoint:
             with tf.io.gfile.GFile(filename, 'wb') as f:
                 f.write(content)
         else:
-            os.makedirs(filename, exist_ok=True)
+            os.makedirs(parent_dir(filename), exist_ok=True)
             tmp = parent_dir(filename) + '/' + name(filename) + '.tmp'
             with open(tmp, 'wb') as f:
                 f.write(content)
-            shutil.move(tmp, filename)
+            shutil.move(tmp, filename + '.pkl')
         print('Wrote checkpoint.')
 
     def load_as_dict(self, filename=None):
@@ -87,11 +81,3 @@ class Checkpoint:
         age = time.time() - data['_timestamp']
         print(f'Loaded checkpoint from {age:.0f} seconds ago.')
         return data
-    
-    def load_model(self, model, filename=None):
-        cp_dict = self.load_as_dict()
-        replace_dict = {}
-        for key in model.__dict__.keys():
-            if key in cp_dict and key != 'config':
-                replace_dict[key] = getattr(model, key).load(cp_dict[key])
-        return model.replace(**replace_dict)

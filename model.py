@@ -18,7 +18,6 @@ from jax._src.nn.initializers import _compute_fans
 def xavier_uniform_pytorchlike():
     def init(key, shape, dtype):
         dtype = dtypes.canonicalize_dtype(dtype)
-        named_shape = core.as_named_shape(shape)
         if len(shape) == 2: # Dense, [in, out]
             fan_in = shape[0]
             fan_out = shape[1]
@@ -49,6 +48,7 @@ class TrainConfig:
             'bias_init': self.kern_init('bias', zero=True),
             'dtype': self.dtype,
         }
+
 
 class TimestepEmbedder(nn.Module):
     """
@@ -88,7 +88,8 @@ class TimestepEmbedder(nn.Module):
         embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
         embedding = embedding.astype(self.tc.dtype)
         return embedding
-    
+
+
 class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
@@ -99,11 +100,24 @@ class LabelEmbedder(nn.Module):
 
     @nn.compact
     def __call__(self, labels):
-        embedding_table = nn.Embed(self.num_classes + 1, self.hidden_size, 
-                                   embedding_init=nn.initializers.normal(0.02), dtype=self.tc.dtype)
+        embedding_table = nn.Embed(self.num_classes + 1, self.hidden_size, embedding_init=nn.initializers.normal(0.02), dtype=self.tc.dtype)
         embeddings = embedding_table(labels)
         return embeddings
-    
+
+class BlockEmbedder(nn.Module):
+    """
+    Embeds block (depth) labels into vector representations. Also handles label dropout for classifier-free guidance.
+    """
+    depth: int
+    hidden_size: int
+    tc: TrainConfig
+
+    @nn.compact
+    def __call__(self, blocks):
+        embedding_table = nn.Embed(self.depth + 1, self.hidden_size, embedding_init=nn.initializers.normal(0.02), dtype=self.tc.dtype)
+        embeddings = embedding_table(blocks)
+        return embeddings
+
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
     patch_size: int
@@ -121,7 +135,8 @@ class PatchEmbed(nn.Module):
                      dtype=self.tc.dtype)(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
-    
+
+
 class MlpBlock(nn.Module):
     """Transformer MLP / feed-forward block."""
     mlp_dim: int
@@ -140,7 +155,8 @@ class MlpBlock(nn.Module):
         output = nn.Dense(features=actual_out_dim, **self.tc.default_config())(x)
         output = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(output)
         return output
-    
+
+
 def modulate(x, shift, scale):
     # scale = jnp.clip(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
@@ -194,7 +210,8 @@ class DiTBlock(nn.Module):
                          dropout_rate=self.dropout, train=self.train)(x_modulated2)
         x = x + (gate_mlp[:, None] * mlp_x)
         return x
-    
+
+
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
@@ -217,6 +234,7 @@ class FinalLayer(nn.Module):
                      bias_init=self.tc.kern_init('final_bias', zero=True), dtype=self.tc.dtype)(x)
         return x
 
+
 class DiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
@@ -224,6 +242,9 @@ class DiT(nn.Module):
     patch_size: int
     hidden_size: int
     depth: int
+    depth_min: int
+    depth_group: int
+    depth_wise: int
     num_heads: int
     mlp_ratio: float
     out_channels: int
@@ -232,13 +253,14 @@ class DiT(nn.Module):
     ignore_dt: bool = False
     dropout: float = 0.0
     dtype: Dtype = jnp.bfloat16
+    num_sections: int = 7
 
     @nn.compact
-    def __call__(self, x, t, dt, y, train=False, return_activations=False):
-        # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
-        print("DiT: Input of shape", x.shape, "dtype", x.dtype)
+    #def __call__(self, t, x, dt, y, train=False, return_activations=False):
+    def __call__(self, t, x, args, train=False, return_activations=False, blocks=None):
+        *args, dt, y = args
+        #print("DiT: Input of shape", x.shape, "dtype", x.dtype, t)
         activations = {}
-
         batch_size = x.shape[0]
         input_size = x.shape[1]
         in_channels = x.shape[-1]
@@ -246,37 +268,56 @@ class DiT(nn.Module):
         num_patches_side = input_size // self.patch_size
         tc = TrainConfig(dtype=self.dtype)
 
-        if self.ignore_dt:
-            dt = jnp.zeros_like(t)
-        
-        # pos_embed = self.param("pos_embed", get_2d_sincos_pos_embed, self.hidden_size, num_patches)
-        # pos_embed = jax.lax.stop_gradient(pos_embed)
+        if t.shape == ():   t = t * jnp.ones_like(y)
+        if self.ignore_dt: dt =    jnp.zeros_like(t)
+
         pos_embed = get_2d_sincos_pos_embed(None, self.hidden_size, num_patches)
         x = PatchEmbed(self.patch_size, self.hidden_size, tc=tc)(x) # (B, num_patches, hidden_size)
-        print("DiT: After patch embed, shape is", x.shape, "dtype", x.dtype)
         activations['patch_embed'] = x
 
         x = x + pos_embed
         x = x.astype(self.dtype)
         te = TimestepEmbedder(self.hidden_size, tc=tc)(t) # (B, hidden_size)
-        dte = TimestepEmbedder(self.hidden_size, tc=tc)(dt) # (B, hidden_size)
+        dte= TimestepEmbedder(self.hidden_size, tc=tc)(dt) # (B, hidden_size)
+        #dte= LabelEmbedder(self.num_sections, self.hidden_size, tc=tc)(dt) # (B, hidden_size)
         ye = LabelEmbedder(self.num_classes, self.hidden_size, tc=tc)(y) # (B, hidden_size)
         c = te + ye + dte
-        
+
         activations['pos_embed'] = pos_embed
         activations['time_embed'] = te
         activations['dt_embed'] = dte
         activations['label_embed'] = ye
         activations['conditioning'] = c
 
-        print("DiT: Patch Embed of shape", x.shape, "dtype", x.dtype)
-        print("DiT: Conditioning of shape", c.shape, "dtype", c.dtype)
-        for i in range(self.depth):
-            x = DiTBlock(self.hidden_size, self.num_heads, tc, self.mlp_ratio, self.dropout, train)(x, c)
-            activations[f'dit_block_{i}'] = x
+        if self.depth_wise > 0 and self.depth_wise <= self.depth:
+            xr = jnp.zeros_like(x)
+            vr = jnp.zeros_like(x)
+            xr = xr + x  # xt
+            group = self.depth_group
+            depth = self.depth_wise if blocks is None else self.depth
+            block = depth * jnp.ones((batch_size,), dtype=jnp.int32) if blocks is None else blocks
+            # block embedder:
+            be = BlockEmbedder(self.depth, self.hidden_size, tc=tc)(block) # (B, hidden_size)  # old code
+            #b = 1.0 * block / self.depth
+            #be = TimestepEmbedder(self.hidden_size, tc=tc)(block) # (B, hidden_size)  # new code
+            activations['block_embed'] = be
+            cb = c + be
+            for i in range(depth):
+                delta = 1.0 * (i < block) #* group / block  # delta per group of blocks
+                delta = delta[:, None, None]
+                gend = i % group == group - 1
+                vb = DiTBlock(self.hidden_size, self.num_heads, tc, self.mlp_ratio, self.dropout, train)(xr, cb)
+                activations[f'dit_block_{i}'] = vb
+                xr = xr + delta * vb if gend else vb
+                vr = vr + delta * vb if gend else vr
+            x = vr  # vector field
+        else:  # conventional
+            for i in range(self.depth):
+                x = DiTBlock(self.hidden_size, self.num_heads, tc, self.mlp_ratio, self.dropout, train)(x, c)
+                activations[f'dit_block_{i}'] = x
+
         x = FinalLayer(self.patch_size, self.out_channels, self.hidden_size, tc)(x, c) # (B, num_patches, p*p*c)
         activations['final_layer'] = x
-        # print("DiT: FinalLayer of shape", x.shape, "dtype", x.dtype)
         x = jnp.reshape(x, (batch_size, num_patches_side, num_patches_side, 
                             self.patch_size, self.patch_size, self.out_channels))
         x = jnp.einsum('bhwpqc->bhpwqc', x)

@@ -1,11 +1,12 @@
 import jax
 import jax.experimental
-import wandb
+import wandb, os
 import jax.numpy as jnp
 import numpy as np
-import tqdm
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 from functools import partial
+from diffrax import diffeqsolve, ODETerm, SaveAt, ConstantStepSize, PIDController, Euler, Dopri5, Tsit5
 
 def eval_model(
     FLAGS,
@@ -29,20 +30,17 @@ def eval_model(
         key = jax.random.PRNGKey(42 + jax.process_index())
         batch_images, batch_labels = next(dataset)
         valid_images, valid_labels = next(dataset_valid)
-        if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+        if FLAGS.model.use_stable_vae:
             batch_images = vae_encode(key, batch_images)
             valid_images = vae_encode(key, valid_images)
-        if 'latent' in FLAGS.dataset_name:
-            eps_valid = valid_images[..., :valid_images.shape[-1]//2]
-            batch_images = batch_images[..., batch_images.shape[-1]//2:]
-            valid_images = valid_images[..., valid_images.shape[-1]//2:]
         batch_labels_sharded, valid_labels_sharded = shard_data(batch_labels, valid_labels)
         labels_uncond = shard_data(jnp.ones(batch_labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes']) # Null token
         eps = jax.random.normal(key, batch_images.shape)
 
         def process_img(img):
             if FLAGS.model.use_stable_vae:
-                img = vae_decode(img[None])[0]
+                #img = vae_decode(img[None])[0]
+                img = vae_decode(img)
             img = img * 0.5 + 0.5
             img = jnp.clip(img, 0, 1)
             img = np.array(img)
@@ -54,8 +52,37 @@ def eval_model(
                 call_fn = train_state.call_model_ema
             else:
                 call_fn = train_state.call_model
-            output = call_fn(images, t, dt, labels, train=False)
+            output = call_fn(t, images, (dt, labels), train=False)
             return output
+
+        #################################################################
+        @jax.jit
+        def solve(train_state, images, t0, t1, dt0, dt, y, use_ema=True):
+            if use_ema and FLAGS.model.use_ema:
+                call_fn = train_state.call_model_ema
+            else:
+                call_fn = train_state.call_model
+
+            vf = ODETerm(call_fn)
+
+            if FLAGS.inference_solver == 'euler':
+                solver = Euler()
+            elif FLAGS.inference_solver == 'dopri5':
+                solver = Dopri5()
+            elif FLAGS.inference_solver == 'tsit5':
+                solver = Tsit5()
+
+            if FLAGS.inference_stepsize == 'const':
+                controller = ConstantStepSize()
+                dt0 = dt0
+            elif FLAGS.inference_stepsize == 'pid':
+                controller = PIDController(rtol=FLAGS.inference_tol, atol=FLAGS.inference_tol)
+                dt0 = None
+            
+            #saveat = SaveAt(ts=jnp.linspace(0, 1, FLAGS.inference_timesteps))
+            sol = diffeqsolve(vf, solver, t0=t0, t1=t1, dt0=dt0, y0=images, args=(dt, y), stepsize_controller=controller)  #, saveat=saveat)'
+            return sol
+        #################################################################
 
         print("Training Loss per T.")
         if FLAGS.model.denoise_timesteps == 128:
@@ -64,13 +91,13 @@ def eval_model(
         else:
             fig, axs = plt.subplots(3, 6, figsize=(15, 8))
             d_list = [0, 1, 2, 3, 4, 5]
+        
         for d in d_list:
             infos = None
             for t in np.arange(0, 32):
                 t = t * (1.0 / 32)
-
                 batch_images_n, batch_labels_n = next(dataset)
-                if FLAGS.model.use_stable_vae and 'latent' not in FLAGS.dataset_name:
+                if FLAGS.model.use_stable_vae:
                     batch_images_n = vae_encode(key, batch_images_n)
                 batch_images_sharded, batch_labels_sharded = shard_data(batch_images_n, batch_labels_n)
                 _, info = update(train_state, train_state_teacher, batch_images_sharded, batch_labels_sharded, force_t=t, force_dt=d)
@@ -94,8 +121,6 @@ def eval_model(
 
 
         print("One-step Denoising at various t.")
-        if 'latent' in FLAGS.dataset_name:
-            eps = eps_valid
         for dt_type in ['flow', 'shortcut']:
             if len(jax.local_devices()) == 8:
                 if dt_type == 'flow':
@@ -133,67 +158,69 @@ def eval_model(
                     plt.close(fig)
 
         print("Denoising at N steps")
-
         denoise_timesteps_list = [1, 2, 4, 8, 16, 32]
         if FLAGS.model.denoise_timesteps == 128:
             denoise_timesteps_list.append(128)
         if FLAGS.model.cfg_scale != 0:
             denoise_timesteps_list.append('cfg')
-        for denoise_timesteps in denoise_timesteps_list:
-            do_cfg = False
-            if denoise_timesteps == 'cfg':
-                denoise_timesteps = denoise_timesteps_list[-2]
-                do_cfg = True
-            all_x = []
-            delta_t = 1.0 / denoise_timesteps
-            x = eps # [local_batch, ...]
-            x = shard_data(x) # [batch, ...] (on all devices)
-            for ti in range(denoise_timesteps):
-                t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
-                t_vector = jnp.full((eps.shape[0],), t)
-                dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
-                if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
-                    dt_base = jnp.zeros_like(t_vector)
-                t_vector, dt_base = shard_data(t_vector, dt_base)
-                if not do_cfg:
-                    v = call_model(train_state, x, t_vector, dt_base, visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond)
-                else:
-                    v_cond = call_model(train_state, x, t_vector, dt_base, visualize_labels)
-                    v_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
-                    v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
-                x = x + v * delta_t
-                if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
-                    np_x = jax.experimental.multihost_utils.process_allgather(x)
-                    all_x.append(np.array(np_x))
-            all_x = np.stack(all_x, axis=1) # [batch, timesteps, etc..]
-            all_x = all_x[:, -8:]
-            if jax.process_index() == 0:
-                fig, axs = plt.subplots(8, 8, figsize=(30, 30))
-                for j in range(8):
-                    for t in range(min(8, all_x.shape[1])):
-                        axs[t, j].imshow(process_img(all_x[j, t]), vmin=0, vmax=1)
-                d_label = 'cfg' if do_cfg else denoise_timesteps
-                wandb.log({f'sample_N/{d_label}': wandb.Image(fig)}, step=step)
-                plt.close(fig)
+        if 0:
+            for denoise_timesteps in denoise_timesteps_list:
+                do_cfg = False
+                if denoise_timesteps == 'cfg':
+                    denoise_timesteps = denoise_timesteps_list[-2]
+                    do_cfg = True
+                all_x = []
+                delta_t = 1.0 / denoise_timesteps
+                x = eps # [local_batch, ...]
+                x = shard_data(x) # [batch, ...] (on all devices)
+                for ti in range(denoise_timesteps):
+                    t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
+                    t_vector = jnp.full((eps.shape[0],), t)
+                    dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
+                    if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
+                        dt_base = jnp.zeros_like(t_vector)
+                    t_vector, dt_base = shard_data(t_vector, dt_base)
+                    if not do_cfg:
+                        v = call_model(train_state, x, t_vector, dt_base, visualize_labels if FLAGS.model.cfg_scale != 0 else labels_uncond)
+                    else:
+                        v_cond = call_model(train_state, x, t_vector, dt_base, visualize_labels)
+                        v_uncond = call_model(train_state, x, t_vector, dt_base, labels_uncond)
+                        v = v_uncond + FLAGS.model.cfg_scale * (v_cond - v_uncond)
+                    x = x + v * delta_t
+                    if denoise_timesteps <= 8 or ti % (denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
+                        np_x = jax.experimental.multihost_utils.process_allgather(x)
+                        all_x.append(np.array(np_x))
+                all_x = np.stack(all_x, axis=1) # [batch, timesteps, etc..]
+                all_x = all_x[:, -8:]
+                if jax.process_index() == 0:
+                    fig, axs = plt.subplots(8, 8, figsize=(30, 30))
+                    for j in range(8):
+                        for t in range(min(8, all_x.shape[1])):
+                            axs[t, j].imshow(process_img(all_x[j, t]), vmin=0, vmax=1)
+                    d_label = 'cfg' if do_cfg else denoise_timesteps
+                    wandb.log({f'sample_N/{d_label}': wandb.Image(fig)}, step=step)
+                    plt.close(fig)
 
         def do_fid_calc(cfg_scale, denoise_timesteps):
-            activations = []
-            images_shape = batch_images.shape
+            delta_t = 1.0 / denoise_timesteps
             num_generations = 4096
+            images_shape = batch_images.shape
+            activations = []
             print(f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
-            for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
+            gens = tqdm(range(num_generations // FLAGS.batch_size))
+            for gen in gens:
                 key = jax.random.PRNGKey(42)
-                key = jax.random.fold_in(key, fid_it)
+                key = jax.random.fold_in(key, gen)
                 key = jax.random.fold_in(key, jax.process_index())
                 eps_key, label_key = jax.random.split(key)
                 x = jax.random.normal(eps_key, images_shape)
                 labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
                 x, labels = shard_data(x, labels)
-                delta_t = 1.0 / denoise_timesteps
+                
                 for ti in range(denoise_timesteps):
-                    t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
+                    t = 1.0 * ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
                     t_vector = jnp.full((images_shape[0], ), t)
-                    dt_base = jnp.ones_like(t_vector) * np.log2(denoise_timesteps)
+                    dt_base = (jnp.ones_like(t_vector) * np.log2(denoise_timesteps)).astype(jnp.int32)
                     if FLAGS.model.train_type == 'livereflow' and denoise_timesteps < 128:
                         dt_base = jnp.zeros_like(t_vector)
                     t_vector, dt_base = shard_data(t_vector, dt_base)
@@ -206,18 +233,20 @@ def eval_model(
                         v_pred_label = call_model(train_state, x, t_vector, dt_base, labels)
                         v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
                     x = x + v * delta_t # Euler sampling.
+                
                 if FLAGS.model.use_stable_vae:
                     x = vae_decode(x) # Image is in [-1, 1] space.
+                
                 x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
                 x = jnp.clip(x, -1, 1)
-                acts = get_fid_activations(x)[..., 0, 0, :] # [devices, batch//devices, 2048]
+                acts = get_fid_activations(x)
                 acts = jax.experimental.multihost_utils.process_allgather(acts)
                 acts = np.array(acts)
                 activations.append(acts)
             return activations
         
         if FLAGS.fid_stats is not None:
-            denoise_timesteps_list = [1, 4, 32]
+            denoise_timesteps_list = [1, 4]  #[1, 4, 32]
             if FLAGS.model.denoise_timesteps == 128:
                 denoise_timesteps_list.append(128)
             if FLAGS.model.cfg_scale != 0:

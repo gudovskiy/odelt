@@ -1,57 +1,45 @@
-## One-Step Diffusion via Shortcut Models 
-
-Kevin Frans, Danijar Hafner, Sergey Levine, Pieter Abbeel
-
-[Paper Link](https://arxiv.org/abs/2410.12557)
-[Website Link](https://kvfrans.com/shortcut-models/)
+## $\textrm{ODE}_t \left(\textrm{ODE}_l \right)$: Shortcutting the Time and Length in Diffusion and Flow Models for Faster Sampling
 
 ### Abstract
-Diffusion models and flow-matching models have enabled generating diverse and realistic images by learning to transfer noise to data.
-However, sampling from these models involves iterative denoising over many neural network passes, making generation slow and expensive.
-Previous approaches for speeding up sampling require complex training regimes, such as multiple training phases, multiple networks, or fragile scheduling.
-We introduce shortcut models, a family of generative models that use a single network and training phase to produce high-quality samples in a single or multiple sampling steps.
-Shortcut models condition the network not only on the current noise level but also on the desired step size, allowing the model to skip ahead in the generation process.
-Across a wide range of sampling step budgets, shortcut models consistently produce higher quality samples than previous approaches, such as consistency models and reflow.
-Compared to distillation, shortcut models reduce complexity to a single network and training phase and additionally allow varying step budgets at inference time.
+Recently, continuous normalizing flows (CNFs) and diffusion models (DMs) have been studied using the unified theoretical framework. Although such models can generate high-quality data points from a noise distribution, the sampling demands multiple iterations to solve an ordinary differential equation (ODE) with high computational complexity. Most existing methods focus on reducing the number of time steps during the sampling process to improve efficiency. In this work, we explore a complementary direction in which the quality-complexity tradeoff can be dynamically controlled in terms of time steps and in the length of the neural network. We achieve this by rewiring the blocks in the transformer-based architecture to solve an inner discretized ODE w.r.t. its length. Then, we employ time- and length-wise consistency terms during flow matching training, and as a result, the sampling can be performed with an arbitrary number of time steps and transformer blocks. Unlike others, our $\textrm{ODE}_t \left(\textrm{ODE}_l \right)$ approach is solver-agnostic in time dimension and decreases both latency and memory usage. Compared to the previous state of the art, image generation experiments on CelebA-HQ and ImageNet show a latency reduction of up to $3\times$ in the most efficient sampling mode, and a FID score improvement of up to $3.5$ points for high-quality sampling. We release our code and weights with fully reproducible experiments in this repo.
 
-![Showcase Figire](data/fig-showcase4.png)
-
-### Overview
-
-Shortcut models can utilize standard diffusion architectures (e.g. DiT), and condition on both `t` and `d`. At `d ≈ 0`, the shortcut objective is equivalent to the flow-matching objective, and can be trained by regressing onto empirical `E[vt|xt]` samples. Targets for larger `d` shortcuts are constructed by concatenating a sequence of two `d/2` shortcuts. Both objectives can be trained jointly; shortcut models do not require a two-stage procedure or discretization schedule.
-
-![Showcase Figire](data/fig-method5.png)
+<img src="images/scaling.png" alt="CelebA-HQ scaling" width="640">
 
 ### Using the code
-
-This codebase is written in JAX, and was developed on TPU-v3 machines. You should start by installing the conda dependencies from `environment.yml` and `requirements.txt`. To load datasets, we use TFDS, and you can see our specific dataloaders at [https://github.com/kvfrans/tfds_builders](https://github.com/kvfrans/tfds_builders), of course you are free to use your own dataloader as well. 
-
-To train a DiT-B scale model on CelebA:
+We recommend using [mamba or micromamba](https://mamba.readthedocs.io/en/latest/). If prefer conda then use `conda` in place of `micromamba`.
+``` cmd
+micromamba env create -f environment.yml
+pip install -U "jax[cuda12]"==0.5.3
+pip install -r requirements.txt
 ```
-python train.py --model.hidden_size 768 --model.patch_size 2 --model.depth 12 --model.num_heads 12 --model.mlp_ratio 4 --dataset_name celebahq256 --fid_stats data/celeba256_fidstats_ours.npz --model.cfg_scale 0 --model.class_dropout_prob 1 --model.num_classes 1 --batch_size 64 --max_steps 410_000 --model.train_type shortcut
+This codebase is written in JAX and was checked on A6000/H100 GPUs. The commands above install the mamba/conda dependencies from `environment.yml` and `requirements.txt`. To load datasets, we use [TFDS](https://github.com/kvfrans/tfds_builders).
+
+Use the first command to train a DiT-B model with $\textrm{ODE}_t \left(\textrm{ODE}_l \right)$ shortcuts on CelebA-HQ. Then, evaluate by passing the number of active blocks using the `model.depthwise L` argument:
+```
+python train.py --mode train --model.lr 1e-4/1e-5 --model.bootstrap_cfg 0 --model.dropout 0.1 --model.class_dropout_prob 1 --model.num_classes 1 --model.depth_wise 12 --model.depth_group 4 --model.cfg_scale 0 --batch_size 256 --model.train_type shortcut --save_dir ckpts/celeba-shortcut-odelt --load_dir ckpts/celeba-shortcut2-every4400001 --max_steps 100_000 --eval_interval 250000 --save_interval 50000 --fid_stats data/celebahq256_fidstats_jax.npz --dataset_name celebahq256
+python train.py --mode eval --model.depth_wise 4/8/12 --model.num_classes 1 --model.depth_group 4 --batch_size 256 --model.train_type shortcut --fid_stats data/celebahq256_fidstats_jax.npz --dataset_name celebahq256 --load_dir celeba-shortcut-odelt.pkl
 ```
 or on Imagenet-256:
 ``` 
-python train.py --model.hidden_size 768 --model.patch_size 2 --model.depth 12 --model.num_heads 12 --model.mlp_ratio 4 --dataset_name imagenet256 --fid_stats data/imagenet256_fidstats_ours.npz --model.cfg_scale 1.5 --model.class_dropout_prob 0.1 --model.bootstrap_cfg 1 --batch_size 256 --max_steps 810_000 --model.train_type shortcut
+python train.py --mode train --model.lr 1e-4/1e-5 --model.bootstrap_cfg 1 --model.dropout 0.0 --model.class_dropout_prob 0.1 --model.num_classes 1000 --model.depth_wise 12 --model.depth_group 4 --model.cfg_scale 1.5 --batch_size 256 --model.train_type shortcut --save_dir ckpts/imagenet-shortcut-odelt --load_dir ckpts/imagenet-shortcut2-b-fulldata800001 --max_steps 100_000 --eval_interval 250000 --save_interval 50000 --fid_stats data/imagenet256_fidstats_jax.npz --dataset_name imagenet256
+python train.py --mode eval --model.depth_wise 4/8/12 --model.num_classes 1000 --model.depth_group 4 --batch_size 256 --model.train_type shortcut --fid_stats data/imagenet256_fidstats_jax.npz --dataset_name imagenet256 --load_dir imagenet-shortcut-odelt.pkl
 ```
 
-A larger DiT-XL scale model can be trained via:
+A larger DiT-XL scale model can be trained/evaluated via:
 ``` 
-python train.py --model.hidden_size 1152 --model.patch_size 2 --model.depth 28 --model.num_heads 16 --model.mlp_ratio 4 --dataset_name imagenet256 --fid_stats data/imagenet256_fidstats_ours.npz --model.cfg_scale 1.5 --model.class_dropout_prob 0.1 --model.bootstrap_cfg 1 --batch_size 256 --max_steps 810_000 --model.train_type shortcut
+python train.py --mode train --model.lr 1e-4/1e-5 --model.bootstrap_cfg 1 --model.dropout 0.0 --model.class_dropout_prob 0.1 --model.num_classes 1000 --model.depth_wise 28 --model.depth_group 8 --model.cfg_scale 1.5 --batch_size 256 --model.train_type shortcut --save_dir ckpts/xlimagenet-shortcut-odelt --load_dir ckpts/imagenet-shortcut2-xl-fulldata-continue200000 --max_steps 100_000 --eval_interval 250000 --save_interval 50000 --fid_stats data/imagenet256_fidstats_jax.npz --dataset_name imagenet256 --model.hidden_size 1152 --model.depth 28 --model.num_heads 16 --model.depth_min 12
+python train.py --mode eval --model.depth_wise 12/20/28 --model.num_classes 1000 --model.depth_group 8 --batch_size 256 --model.train_type shortcut --fid_stats data/imagenet256_fidstats_jax.npz --dataset_name imagenet256 --load_dir xlimagenet-shortcut-odelt.pkl
 ```
 
-To train a regular flow model instead, use `--model.train_type naive`. This code also supports `--model.sharding fsdp` for fully-sharded data parallelism, which is recommended if you are training on a multi-GPU or TPU machine.
-
-### Sanity Checking
-
-Shorcut models trained with the provided functions should achieve the following FID-50k performance.
-
-|                           | 128-Step| 4-Step  | 1-Step  |
-| --------                  | ------- | ------- | ------- |
-| CelebA (DiT-B)            | 6.9     | 13.8    | 20.5    |
-| Imagenet-256 (DiT-B)      | 15.5    | 28.3    | 40.3    |
-| Imagenet-256 (DiT-XL)     | 3.8     | 7.8     | 10.6    |
+### More flows and ODE solvers
+- To train a regular flow model instead, use `--model.train_type naive/fm/icfm/rfm` where `targets_cfm.py` corresponds to reimplementation of the [PyTorch CFM library](https://github.com/atong01/conditional-flow-matching).
+- To use any adaptive-step ODE solver from [diffrax](https://github.com/patrick-kidger/diffrax) or any other sampling setting, look at `helper_inference.py`.
 
 ### Checkpoints and FID Stats
+Pretrained model checkpoints, and precomputed reference FID stats for CelebA and ImageNet can be downloaded from [this gdrive](https://drive.google.com/drive/folders/1ZzWY9jZBRXKiyTnTG-ZWiWAd4w2PEDIZ?usp=sharing).
 
-Pretrained model checkpoints, and pre-computed reference FID stats for CelebA and Imagenet can be downloaded from [this drive](https://drive.google.com/drive/folders/1g665i0vMxm8qqqcp5mAiexnL919-gMwW?usp=sharing). To load a checkpoint, use the `--load_dir` flag. 
+## 📌 Citation
+If you find this work useful for your research, please consider citing it:
+```bibtex
+TBD
+```

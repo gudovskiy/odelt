@@ -7,9 +7,9 @@ from einops import rearrange
 from flax import struct
 
 from jaxtyping import Array, PyTree, Key, Float, Shaped, Int, UInt8, jaxtyped
-from typeguard import typechecked
+#from typeguard import typechecked
 from functools import partial
-typecheck = partial(jaxtyped, typechecker=typechecked)
+#typecheck = partial(jaxtyped, typechecker=typechecked)
 
 @struct.dataclass
 class StableVAE:
