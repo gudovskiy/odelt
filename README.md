@@ -46,7 +46,7 @@ python train.py --mode eval --model.depth_wise 12/20/28 --model.num_classes 1000
 If you find this work useful for your research, please consider citing it:
 ```bibtex
 @article{odelt,
-  title={ODE$_t$(ODE$_l$): Shortcutting the Time and Length in Diffusion and Flow Models for Faster Sampling},
+  title={{ODE}$_t$({ODE}$_l$): Shortcutting the Time and Length in Diffusion and Flow Models for Faster Sampling},
   author={Denis Gudovskiy and Wenzhao Zheng and Tomoyuki Okuno and Yohei Nakata and Kurt Keutzer},
   journal={arXiv preprint arXiv:2506.21714},
   year={2025}
